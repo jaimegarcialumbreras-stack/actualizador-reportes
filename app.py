@@ -6,57 +6,60 @@ import streamlit as st
 import xlrd
 from openpyxl import load_workbook
 
-st.set_page_config(page_title="Actualizador de reportes", page_icon="📊", layout="centered")
+st.set_page_config(page_title="Actualizador de reportes", page_icon="📊")
 
 st.title("📊 Actualizador de reportes")
-st.write("Sube los cinco archivos Excel. La aplicación actualizará el reporte y generará un único archivo .xlsx para descargar.")
+st.write("Sube Coupons, Promotional Models y el reporte original. Descarga el reporte actualizado.")
 
 st.info(
-    "No necesitas convertir ningún archivo a CSV. "
-    "Coupons, Promotional Models, S.O. y Raw data pueden ser .xls o .xlsx."
+    "Flujo: Coupons se carga en la hoja Raw data y Promotional Models se carga en la hoja S.O. "
+    "No se utilizan archivos CSV."
 )
 
 coupons_file = st.file_uploader("Coupons (.xls o .xlsx)", type=["xls", "xlsx"])
 promo_file = st.file_uploader("Promotional Models (.xls o .xlsx)", type=["xls", "xlsx"])
-excel_original = st.file_uploader("Excel original del reporte (.xlsx)", type=["xlsx"])
-so_file = st.file_uploader("S.O. (.xls o .xlsx)", type=["xls", "xlsx"])
-raw_file = st.file_uploader("Raw data (.xls o .xlsx)", type=["xls", "xlsx"])
+report_file = st.file_uploader("Reporte original (.xlsx)", type=["xlsx"])
 
 
 def is_xls(uploaded_file):
     return uploaded_file.name.lower().endswith(".xls")
 
 
-def read_excel_safely(uploaded_file, preferred_sheet_contains=None):
-    """Lee la primera hoja, o la primera cuyo nombre contenga el texto indicado."""
+def read_excel_file(uploaded_file, preferred_sheet_text=None):
+    """Lee un Excel .xls o .xlsx y devuelve sus datos y la hoja seleccionada."""
     uploaded_file.seek(0)
 
     if is_xls(uploaded_file):
-        workbook = xlrd.open_workbook(
+        book = xlrd.open_workbook(
             file_contents=uploaded_file.read(),
             ignore_workbook_corruption=True,
         )
-        sheet_names = workbook.sheet_names()
+        sheet_names = book.sheet_names()
 
         if not sheet_names:
             raise ValueError(f'El archivo "{uploaded_file.name}" no contiene hojas.')
 
         selected_sheet = sheet_names[0]
-        if preferred_sheet_contains:
-            search_text = preferred_sheet_contains.lower()
+        if preferred_sheet_text:
             selected_sheet = next(
-                (name for name in sheet_names if search_text in name.lower()),
+                (
+                    name
+                    for name in sheet_names
+                    if preferred_sheet_text.casefold() in name.casefold()
+                ),
                 selected_sheet,
             )
 
-        sheet = workbook.sheet_by_index(sheet_names.index(selected_sheet))
-        data = [sheet.row_values(row_index) for row_index in range(sheet.nrows)]
+        sheet = book.sheet_by_index(sheet_names.index(selected_sheet))
+        rows = [sheet.row_values(row_number) for row_number in range(sheet.nrows)]
 
-        if not data:
-            raise ValueError(f'La hoja "{selected_sheet}" de "{uploaded_file.name}" está vacía.')
+        if not rows:
+            raise ValueError(
+                f'La hoja "{selected_sheet}" del archivo "{uploaded_file.name}" está vacía.'
+            )
 
-        headers = [str(header).strip() for header in data[0]]
-        dataframe = pd.DataFrame(data[1:], columns=headers)
+        headers = [str(value).strip() for value in rows[0]]
+        dataframe = pd.DataFrame(rows[1:], columns=headers)
         return dataframe, selected_sheet
 
     uploaded_file.seek(0)
@@ -67,10 +70,13 @@ def read_excel_safely(uploaded_file, preferred_sheet_contains=None):
         raise ValueError(f'El archivo "{uploaded_file.name}" no contiene hojas.')
 
     selected_sheet = sheet_names[0]
-    if preferred_sheet_contains:
-        search_text = preferred_sheet_contains.lower()
+    if preferred_sheet_text:
         selected_sheet = next(
-            (name for name in sheet_names if search_text in name.lower()),
+            (
+                name
+                for name in sheet_names
+                if preferred_sheet_text.casefold() in name.casefold()
+            ),
             selected_sheet,
         )
 
@@ -83,12 +89,12 @@ def read_excel_safely(uploaded_file, preferred_sheet_contains=None):
     return dataframe, selected_sheet
 
 
-def find_column(dataframe, desired_name):
-    normalized = {
-        str(column).strip().casefold(): column
-        for column in dataframe.columns
-    }
-    return normalized.get(desired_name.casefold())
+def find_column(dataframe, expected_name):
+    expected = expected_name.strip().casefold()
+    for column in dataframe.columns:
+        if str(column).strip().casefold() == expected:
+            return column
+    return None
 
 
 def iso_week_number(value):
@@ -97,37 +103,38 @@ def iso_week_number(value):
 
     try:
         if isinstance(value, datetime):
-            date_value = value
+            parsed_date = value
         else:
-            date_value = pd.to_datetime(value, dayfirst=True, errors="coerce")
+            parsed_date = pd.to_datetime(value, dayfirst=True, errors="coerce")
 
-        if pd.isna(date_value):
+        if pd.isna(parsed_date):
             return ""
 
-        return int(date_value.isocalendar().week)
+        return int(parsed_date.isocalendar().week)
     except (TypeError, ValueError, AttributeError):
         return ""
 
 
 def prepare_coupons(dataframe):
+    dataframe = dataframe.copy()
     date_column = find_column(dataframe, "Fecha Compra")
+
     if date_column is None:
-        available = ", ".join(str(column) for column in dataframe.columns)
+        columns = ", ".join(str(column) for column in dataframe.columns)
         raise ValueError(
             'No se encontró la columna "Fecha Compra" en Coupons. '
-            f"Columnas detectadas: {available}"
+            f"Columnas detectadas: {columns}"
         )
 
-    dataframe = dataframe.copy()
     dataframe["Num de SEM"] = dataframe[date_column].apply(iso_week_number)
 
-    columns = [column for column in dataframe.columns if column != "Num de SEM"]
-    insert_at = min(28, len(columns))
-    columns.insert(insert_at, "Num de SEM")
-    return dataframe[columns]
+    # Columna AC: número 29 para Excel, índice 28 para listas Python.
+    ordered_columns = [column for column in dataframe.columns if column != "Num de SEM"]
+    ordered_columns.insert(min(28, len(ordered_columns)), "Num de SEM")
+    return dataframe[ordered_columns]
 
 
-def excel_value(value):
+def value_for_excel(value):
     if pd.isna(value):
         return None
     if isinstance(value, pd.Timestamp):
@@ -135,78 +142,68 @@ def excel_value(value):
     return value
 
 
-def replace_worksheet(workbook, sheet_name, dataframe):
-    if sheet_name in workbook.sheetnames:
-        worksheet = workbook[sheet_name]
-        workbook.remove(worksheet)
+def replace_sheet_data(workbook, sheet_name, dataframe):
+    """Borra todos los datos de una hoja existente y escribe el dataframe."""
+    if sheet_name not in workbook.sheetnames:
+        available = ", ".join(workbook.sheetnames)
+        raise ValueError(
+            f'No se encontró la hoja "{sheet_name}" en el reporte original. '
+            f"Hojas disponibles: {available}"
+        )
 
-    worksheet = workbook.create_sheet(title=sheet_name)
+    worksheet = workbook[sheet_name]
 
-    for column_index, column_name in enumerate(dataframe.columns, start=1):
-        worksheet.cell(row=1, column=column_index, value=str(column_name))
+    if worksheet.max_row:
+        worksheet.delete_rows(1, worksheet.max_row)
 
-    for row_index, row in enumerate(dataframe.itertuples(index=False, name=None), start=2):
-        for column_index, value in enumerate(row, start=1):
-            worksheet.cell(row=row_index, column=column_index, value=excel_value(value))
+    for column_number, column_name in enumerate(dataframe.columns, start=1):
+        worksheet.cell(row=1, column=column_number, value=str(column_name))
+
+    for row_number, row_values in enumerate(
+        dataframe.itertuples(index=False, name=None),
+        start=2,
+    ):
+        for column_number, value in enumerate(row_values, start=1):
+            worksheet.cell(
+                row=row_number,
+                column=column_number,
+                value=value_for_excel(value),
+            )
 
     worksheet.freeze_panes = "A2"
     worksheet.auto_filter.ref = worksheet.dimensions
 
 
-def move_sheet_to_position(workbook, sheet_name, position):
-    worksheet = workbook[sheet_name]
-    workbook._sheets.remove(worksheet)
-    workbook._sheets.insert(min(position, len(workbook._sheets)), worksheet)
-
-
 if st.button("Procesar y descargar reporte", type="primary"):
-    required_files = {
-        "Coupons": coupons_file,
-        "Promotional Models": promo_file,
-        "Excel original": excel_original,
-        "S.O.": so_file,
-        "Raw data": raw_file,
-    }
-    missing = [name for name, file in required_files.items() if file is None]
+    missing_files = []
+    if coupons_file is None:
+        missing_files.append("Coupons")
+    if promo_file is None:
+        missing_files.append("Promotional Models")
+    if report_file is None:
+        missing_files.append("Reporte original")
 
-    if missing:
-        st.error("Faltan estos archivos: " + ", ".join(missing))
+    if missing_files:
+        st.error("Faltan estos archivos: " + ", ".join(missing_files))
         st.stop()
 
     try:
-        with st.spinner("Leyendo los archivos y actualizando el reporte..."):
-            coupons_df, coupons_sheet = read_excel_safely(
+        with st.spinner("Procesando archivos..."):
+            coupons_df, coupons_sheet = read_excel_file(
                 coupons_file,
-                preferred_sheet_contains="coupon",
+                preferred_sheet_text="coupon",
             )
             coupons_df = prepare_coupons(coupons_df)
 
-            promo_df, promo_sheet = read_excel_safely(promo_file)
-            so_df, so_sheet = read_excel_safely(so_file)
-            raw_df, raw_sheet = read_excel_safely(raw_file)
+            promo_df, promo_sheet = read_excel_file(promo_file)
 
-            excel_original.seek(0)
-            workbook = load_workbook(excel_original)
+            report_file.seek(0)
+            workbook = load_workbook(report_file)
 
-            target_sheets = [
-                ("Coupons", coupons_df),
-                ("Promotional Models", promo_df),
-                ("S.O", so_df),
-                ("Raw data", raw_df),
-            ]
-
-            original_positions = {
-                name: workbook.sheetnames.index(name)
-                for name, _ in target_sheets
-                if name in workbook.sheetnames
-            }
-
-            for sheet_name, dataframe in target_sheets:
-                replace_worksheet(workbook, sheet_name, dataframe)
-
-            for sheet_name, _ in target_sheets:
-                if sheet_name in original_positions:
-                    move_sheet_to_position(workbook, sheet_name, original_positions[sheet_name])
+            # Destinos solicitados:
+            # Coupons -> Raw data; Promotional Models -> S.O.
+            replace_sheet_data(workbook, "Raw data", coupons_df)
+            replace_sheet_data(workbook, "S.O.", promo_df)
 
             output = io.BytesIO()
             workbook.save(output)
@@ -214,16 +211,13 @@ if st.button("Procesar y descargar reporte", type="primary"):
 
         st.success("Reporte actualizado correctamente.")
         st.caption(
-            f"Hoja usada en Coupons: {coupons_sheet} · "
-            f"Promotional Models: {promo_sheet} · "
-            f"S.O.: {so_sheet} · Raw data: {raw_sheet}"
+            f"Coupons: hoja usada “{coupons_sheet}” → Raw data. "
+            f"Promotional Models: hoja usada “{promo_sheet}” → S.O."
         )
 
-        col1, col2 = st.columns(2)
-        col1.metric("Filas Coupons", len(coupons_df))
-        col2.metric("Filas Promotional Models", len(promo_df))
-        col1.metric("Filas S.O.", len(so_df))
-        col2.metric("Filas Raw data", len(raw_df))
+        left, right = st.columns(2)
+        left.metric("Filas cargadas en Raw data", len(coupons_df))
+        right.metric("Filas cargadas en S.O.", len(promo_df))
 
         st.download_button(
             label="Descargar reporte actualizado (.xlsx)",
